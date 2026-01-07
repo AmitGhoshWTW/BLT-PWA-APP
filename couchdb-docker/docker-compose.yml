@@ -1,0 +1,48 @@
+version: "3.8"
+
+services:
+  couchdb:
+    image: couchdb:3.3
+    container_name: blt-couchdb
+    environment:
+      - COUCHDB_USER=admin
+      - COUCHDB_PASSWORD=adminpassword
+    ports:
+      - "5984:5984"
+    volumes:
+      - couchdb_data:/opt/couchdb/data
+      - ./couchdb-init.sh:/docker-entrypoint-initdb.d/init.sh
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5984/_up"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  couchdb-setup:
+    image: curlimages/curl:latest
+    depends_on:
+      couchdb:
+        condition: service_healthy
+    command: >
+      sh -c "
+        echo 'Waiting for CouchDB to be ready...' &&
+        sleep 5 &&
+        echo 'Creating system databases...' &&
+        curl -X PUT http://admin:adminpassword@couchdb:5984/_users &&
+        curl -X PUT http://admin:adminpassword@couchdb:5984/_replicator &&
+        curl -X PUT http://admin:adminpassword@couchdb:5984/_global_changes &&
+        echo 'Creating application database...' &&
+        curl -X PUT http://admin:adminpassword@couchdb:5984/blt_remote_db &&
+        echo 'Enabling CORS...' &&
+        curl -X PUT http://admin:adminpassword@couchdb:5984/_node/_local/_config/httpd/enable_cors -d '\"true\"' &&
+        curl -X PUT http://admin:adminpassword@couchdb:5984/_node/_local/_config/cors/origins -d '\"*\"' &&
+        curl -X PUT http://admin:adminpassword@couchdb:5984/_node/_local/_config/cors/credentials -d '\"true\"' &&
+        curl -X PUT http://admin:adminpassword@couchdb:5984/_node/_local/_config/cors/methods -d '\"GET, PUT, POST, HEAD, DELETE\"' &&
+        curl -X PUT http://admin:adminpassword@couchdb:5984/_node/_local/_config/cors/headers -d '\"accept, authorization, content-type, origin, referer\"' &&
+        echo 'Setup complete!' &&
+        curl http://admin:adminpassword@couchdb:5984/_all_dbs
+      "
+    restart: "no"
+
+volumes:
+  couchdb_data:

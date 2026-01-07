@@ -1,0 +1,11 @@
+{
+  "version": "2.0.9",
+  "releaseDate": "2025-12-04",
+  "releaseNotes": [
+    "Added auto-update system",
+    "Fixed screenshot duplication bug",
+    "Enhanced screenshot placeholder with multiselect",
+    "Improved sync performance"
+  ],
+  "minCompatibleVersion": "2.0.0"
+}
