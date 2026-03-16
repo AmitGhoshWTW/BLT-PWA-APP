@@ -1170,6 +1170,14 @@ export default function ReporterForm({ onSubmit, user: userProp }) {
           {saving ? '💾 Saving...' : '💾 Save Offline'}
         </button>
 
+        <button onClick={() => {
+          fetch("http://localhost:42080/api/run-capture")
+            .then(r => r.json())
+            .then(r => console.log("Response:", r));
+        }}>
+          Run Screen Capture
+        </button>
+
         {/* Summary Text */}
         <p style={{ 
           fontSize: '12px', 

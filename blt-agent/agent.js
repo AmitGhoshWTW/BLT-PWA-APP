@@ -4,6 +4,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+const { spawn } = require('child_process');
+
 const app = express();
 const PORT = 42080;
 
@@ -209,6 +211,49 @@ app.post('/api/test-path', (req, res) => {
     res.json({
       path: testPath,
       exists: false,
+      error: err.message
+    });
+  }
+});
+
+app.get('/api/run-capture', (req, res) => {
+  try {
+    const exePath = "C:\\ScreenCapture\\ScreenCapture.exe"; 
+    const args = ["-m", "Edge", "-v", "-d", "c:\\screenshots4\\"];
+
+    console.log(`[${AGENT_NAME}] ▶ Running: ${exePath} ${args.join(" ")}`);
+    console.log(`[${AGENT_NAME}] ✅ Auto Screen Capture}`);
+
+    const processCapture = spawn(exePath, args, { shell: true });
+
+    let output = "";
+    let errorOutput = "";
+
+    processCapture.stdout.on("data", (data) => {
+      console.log(`[Capture] ${data}`);
+      output += data.toString();
+    });
+
+    processCapture.stderr.on("data", (data) => {
+      console.error(`[Capture ERR] ${data}`);
+      errorOutput += data.toString();
+    });
+
+    processCapture.on("close", (code) => {
+      console.log(`[${AGENT_NAME}] Capture process exited with code ${code}`);
+
+      res.json({
+        success: code === 0,
+        exitCode: code,
+        stdout: output,
+        stderr: errorOutput
+      });
+    });
+
+  } catch (err) {
+    console.error(`[${AGENT_NAME}] ❌ Capture error:`, err);
+    res.status(500).json({
+      success: false,
       error: err.message
     });
   }
