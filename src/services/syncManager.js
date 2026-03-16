@@ -1,3 +1,6 @@
+// src/services/syncManager.js
+// Updated with dual backend support (CouchDB / Cosmos DB) + Azure Blob Storage for attachments
+
 import PouchDB from "pouchdb-browser";
 import { localDB } from "./pouchdbService";
 import eventBus from "../utils/eventBus";
@@ -46,6 +49,10 @@ let syncHandler = null;
 let localChangesHandler = null;
 let cosmosPollingInterval = null;
 let lastSyncTime = null;
+
+// Track synced documents by Cosmos _ts timestamp to prevent duplicate processing
+// Key: docId, Value: _ts (Cosmos timestamp)
+const syncedDocRevisions = new Map();
 
 // Legacy variables (for backward compatibility)
 let REMOTE_URL = null;
@@ -589,6 +596,8 @@ async function pushDocumentToCosmosDB(doc) {
       await cosmosRequest('DELETE', `/docs/${cosmosId}`, null, {
         'x-ms-documentdb-partitionkey': `["${cosmosId}"]`
       });
+      // Remove from tracking
+      syncedDocRevisions.delete(doc._id);
       console.log('[syncManager] Cosmos: Deleted', doc._id);
     } catch (error) {
       if (!error.message.includes('404')) throw error;
@@ -611,10 +620,16 @@ async function pushDocumentToCosmosDB(doc) {
       throw new Error(`Document too large: ${docSize} bytes`);
     }
     
-    await cosmosRequest('POST', '/docs', cosmosDoc, {
+    const response = await cosmosRequest('POST', '/docs', cosmosDoc, {
       'x-ms-documentdb-is-upsert': 'True',
       'x-ms-documentdb-partitionkey': `["${cosmosId}"]`
     });
+    
+    // Track the Cosmos timestamp so pull doesn't re-process this document
+    if (response && response._ts) {
+      syncedDocRevisions.set(doc._id, response._ts);
+    }
+    
     console.log('[syncManager] Cosmos: Upserted', doc._id, hasAttachments ? `(${Object.keys(attachmentMeta).length} blobs)` : '');
   }
 }
@@ -654,6 +669,7 @@ async function pushToCosmosDB() {
 
 /**
  * Pull documents from Cosmos DB
+ * Only processes documents that have actually changed
  */
 async function pullFromCosmosDB() {
   try {
@@ -670,30 +686,65 @@ async function pullFromCosmosDB() {
       'Content-Type': 'application/query+json'
     });
 
-    let pullCount = 0;
+    let actualNewDocs = 0;
     let hasReports = false;
     let hasScreenshots = false;
 
     if (result && result.Documents) {
       for (const cosmosDoc of result.Documents) {
+        const docId = cosmosDoc._pouchId || cosmosDoc.id;
+        const cosmosTs = cosmosDoc._ts; // Cosmos timestamp - most reliable change indicator
+        
+        // Skip if we've already processed this exact version (by timestamp)
+        const cachedTs = syncedDocRevisions.get(docId);
+        if (cachedTs && cachedTs >= cosmosTs) {
+          continue; // Already have this version or newer
+        }
+
         try {
+          // Check if document exists locally and compare
+          let existingDoc;
+          let isNewOrChanged = true;
+          
+          try {
+            existingDoc = await localDB.get(docId);
+            // If local doc has same or newer timestamp, skip
+            if (existingDoc._cosmosTs && existingDoc._cosmosTs >= cosmosTs) {
+              syncedDocRevisions.set(docId, cosmosTs);
+              isNewOrChanged = false;
+            }
+          } catch (e) {
+            // Document doesn't exist locally - definitely new
+            isNewOrChanged = true;
+          }
+
+          if (!isNewOrChanged) {
+            continue;
+          }
+
           // Convert to PouchDB format (with attachment restoration)
           const pouchDoc = await toPouchFormat(cosmosDoc, true);
           
-          // Check for existing document
-          let existingDoc;
-          try {
-            existingDoc = await localDB.get(pouchDoc._id);
+          // Store cosmos timestamp for future comparison
+          pouchDoc._cosmosTs = cosmosTs;
+          
+          if (existingDoc) {
             pouchDoc._rev = existingDoc._rev;
-          } catch (e) {
+          } else {
             delete pouchDoc._rev;
           }
 
           await localDB.put(pouchDoc);
-          pullCount++;
+          
+          // Track this version as synced
+          syncedDocRevisions.set(docId, cosmosTs);
+          
+          actualNewDocs++;
 
           if (pouchDoc._id.startsWith('report:')) hasReports = true;
           if (pouchDoc._id.startsWith('screenshot:')) hasScreenshots = true;
+          if (pouchDoc._id.startsWith('logfile:')) hasReports = true;
+          
         } catch (error) {
           if (error.status !== 409) {
             console.error('[syncManager] Cosmos pull doc failed:', cosmosDoc.id, error.message);
@@ -701,21 +752,23 @@ async function pullFromCosmosDB() {
         }
       }
 
-      if (pullCount > 0) {
-        console.log('[syncManager] Cosmos: Pulled', pullCount, 'docs');
+      // Only emit UI event if there are genuinely new documents
+      if (actualNewDocs > 0) {
+        console.log('[syncManager] Cosmos: Pulled', actualNewDocs, 'new docs');
         
         eventBus.emit('data-synced', {
           direction: 'pull',
-          docCount: pullCount,
+          docCount: actualNewDocs,
           hasReports,
           hasScreenshots,
           backend: 'cosmosdb'
         });
       }
+      // If no new docs, stay completely silent - no logs, no events
     }
 
     lastSyncTime = new Date();
-    return pullCount;
+    return actualNewDocs;
   } catch (error) {
     console.error('[syncManager] Cosmos pull failed:', error);
     throw error;
@@ -850,11 +903,12 @@ function startCosmosDBSync() {
 
   console.log("[syncManager] Starting Cosmos DB sync...");
 
-  // Initial sync
+  // Initial sync (silent - don't trigger UI refresh for initial load)
   syncCosmosDB().catch(console.error);
 
-  // Poll for changes every 10 seconds
-  const pollInterval = 10000;
+  // Poll for changes every 5 seconds for near-instant sync
+  // Smart deduplication prevents flickering even with frequent polling
+  const pollInterval = 5000;
   cosmosPollingInterval = setInterval(async () => {
     try {
       await pullFromCosmosDB();
@@ -863,7 +917,7 @@ function startCosmosDBSync() {
     }
   }, pollInterval);
 
-  // Watch local changes and push immediately
+  // Watch local changes and push immediately (but don't emit UI events for local changes)
   localChangesHandler = localDB.changes({
     since: 'now',
     live: true,
@@ -873,14 +927,8 @@ function startCosmosDBSync() {
     if (change.doc && !change.doc._id.startsWith('_design/')) {
       try {
         await pushDocumentToCosmosDB(change.doc);
-        
-        eventBus.emit('data-synced', {
-          direction: 'push',
-          docCount: 1,
-          hasReports: change.doc._id.startsWith('report:'),
-          hasScreenshots: change.doc._id.startsWith('screenshot:'),
-          backend: 'cosmosdb'
-        });
+        // Tracking is now handled inside pushDocumentToCosmosDB
+        // Don't emit UI event for local pushes - the UI already knows about local changes
       } catch (error) {
         console.error("[syncManager] Push to Cosmos failed:", error.message);
       }
@@ -958,8 +1006,18 @@ export function getSyncStatus() {
     backendDisplayName: getBackendDisplayName(),
     remoteUrl: isCouchDB() ? REMOTE_URL : COSMOSDB_CONFIG.endpoint,
     blobStorageConfigured: isBlobStorageConfigured(),
-    lastSync: lastSyncTime
+    lastSync: lastSyncTime,
+    cachedDocCount: syncedDocRevisions.size
   };
+}
+
+/**
+ * Clear sync cache (forces full re-sync on next poll)
+ */
+export function clearSyncCache() {
+  syncedDocRevisions.clear();
+  lastSyncTime = null;
+  console.log('[syncManager] Sync cache cleared');
 }
 
 /**
